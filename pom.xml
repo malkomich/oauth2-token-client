@@ -6,7 +6,7 @@
 
     <groupId>com.github.malkomich</groupId>
     <artifactId>oauth2-token-client</artifactId>
-    <version>0.0.1-SNAPSHOT</version>
+    <version>0.0.1</version>
     <packaging>jar</packaging>
 
     <name>Oauth2 Token Client</name>
