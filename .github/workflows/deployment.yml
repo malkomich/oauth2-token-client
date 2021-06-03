@@ -1,0 +1,139 @@
+name: Deployment
+
+on:
+  pull_request:
+    branches: [ master ]
+    types: [ closed ]
+
+env:
+  SOURCE_BRANCH: ${{ github.event.pull_request.head.ref }}
+
+jobs:
+  check_branch:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.merged
+    outputs:
+      needs_deploy: ${{ steps.check.outputs.needs_deploy }}
+    steps:
+      - id: check
+        name: Check if the branch has to be deployed
+        run: |
+          echo "Source Branch: $SOURCE_BRANCH"
+          if [[ "$SOURCE_BRANCH" =~ ^(release|feature|fix)/.+$ ]]; then
+            echo "::set-output name=needs_deploy::true"
+          else
+            echo "::set-output name=needs_deploy::false"
+          fi
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: check_branch
+    if: needs.check_branch.outputs.needs_deploy == 'true'
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set up Java for publishing to Maven Central Repository
+        uses: actions/setup-java@v2
+        with:
+          java-version: '11'
+          distribution: 'adopt'
+          server-id: ossrh
+          server-username: OSSRH_USER
+          server-password: OSSRH_PASSWORD
+          gpg-passphrase: GPG_PASSPHRASE
+
+      - name: Prepare the new version number
+        run: |
+          PROJECT_VERSION=$(
+            mvn org.apache.maven.plugins:maven-help-plugin:3.1.0:evaluate \
+            -q -DforceStdout -Dexpression=project.version \
+          )
+          echo "The current project version is ${PROJECT_VERSION}"
+
+          echo "::set-env name=NEW_VERSION::$(echo $PROJECT_VERSION | cut -d'-' -f1)"
+        env:
+          ACTIONS_ALLOW_UNSECURE_COMMANDS: 'true'
+
+      - name: Install gpg secret key
+        run: |
+          cat <(echo -e "${{ secrets.GPG_SECRET_KEY }}") | gpg --batch --import
+
+      - name: Generate new project version
+        run: |
+          echo "The new project version is ${NEW_VERSION}"
+          mvn versions:set -DnewVersion=$NEW_VERSION --no-transfer-progress
+
+      - name: Set artifact id as ENV variable
+        run: |
+          echo "::set-env name=ARTIFACT_ID::$( \
+            mvn org.apache.maven.plugins:maven-help-plugin:3.1.0:evaluate \
+            -q -DforceStdout -Dexpression=project.artifactId \
+          )"
+        env:
+          ACTIONS_ALLOW_UNSECURE_COMMANDS: 'true'
+
+      - name: Configure git
+        run: |
+          git config --global committer.email "noreply@github.com"
+          git config --global committer.name "GitHub"
+          git config --global author.email "${GITHUB_ACTOR}@users.noreply.github.com"
+          git config --global author.name "${GITHUB_ACTOR}"
+          git config --global push.followTags true
+
+      - id: git
+        name: Commit & tag new version
+        run: |
+          git diff --quiet && git diff --staged --quiet || \
+            git commit -am "[github-actions] prepare version ${NEW_VERSION}"
+
+          git tag -a "${ARTIFACT_ID}-${NEW_VERSION}" -m "${NEW_VERSION} release"
+
+          git pull origin ${{ github.event.ref }}
+          git push origin ${{ github.event.ref }}
+
+          echo "::set-output name=deploying::true"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Deploy the artifact to the Maven Central Repository
+        run: |
+          export GPG_TTY=$(tty)
+          mvn --batch-mode --no-transfer-progress \
+          deploy
+        env:
+          OSSRH_USER: 'malkomich'
+          OSSRH_PASSWORD: ${{ secrets.OSSRH_PASSWORD }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          DEPLOY: true
+
+      - name: Rollback if failure
+        if: failure() && steps.git.outputs.deploying
+        run: |
+          V_MAJOR=$(echo "$NEW_VERSION" | cut -d'.' -f1)
+          V_MINOR=$(echo "$NEW_VERSION" | cut -d'.' -f2)
+          V_PATCH=$(echo "$NEW_VERSION" | cut -d'.' -f3)
+
+          if [[ "$SOURCE_BRANCH" == "release/"* && "$V_MAJOR" > 0 ]]; then
+            echo "Release"
+            V_MAJOR=$(($V_MAJOR - 1))
+          elif [[ "$SOURCE_BRANCH" == "feature/"* && "$V_MINOR" > 0 ]]; then
+            echo "Feature"
+            V_MINOR=$(($V_MINOR - 1))
+          elif [[ "$SOURCE_BRANCH" == "fix/"* && "$V_PATCH" > 0 ]]; then
+            echo "Fix"
+            V_PATCH=$(($V_PATCH - 1))
+          fi
+
+          ROLLBACK_VERSION=$(echo "${V_MAJOR}.${V_MINOR}.${V_PATCH}")
+
+          echo "The rollback version is ${ROLLBACK_VERSION}"
+          mvn versions:set -DnewVersion=$ROLLBACK_VERSION --no-transfer-progress
+          git add .
+          git commit -m "[github-actions] rollback version ${ROLLBACK_VERSION}"
+
+          echo "Removing ${ARTIFACT_ID}-${NEW_VERSION} tag"
+          git push --delete origin "${ARTIFACT_ID}-${NEW_VERSION}"
+          git pull origin ${{ github.event.ref }}
+          git push origin ${{ github.event.ref }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

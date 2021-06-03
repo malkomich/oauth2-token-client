@@ -1,0 +1,103 @@
+name: Prepare snapshot
+
+on:
+  create:
+    branches:
+      - release/*
+      - feature/*
+      - fix/*
+
+jobs:
+  check_snapshot:
+    runs-on: ubuntu-latest
+    outputs:
+      is_snapshot: ${{ steps.get_version.outputs.snapshot }}
+    steps:
+      - uses: actions/checkout@v2
+
+      - id: get_version
+        name: Get project version
+        run: |
+          PROJECT_VERSION=$( \
+            mvn org.apache.maven.plugins:maven-help-plugin:3.1.0:evaluate \
+            -q -DforceStdout -Dexpression=project.version \
+          )
+
+          if [[ "$PROJECT_VERSION" == *"SNAPSHOT" ]]; then
+            IS_SNAPSHOT=true
+          else
+            IS_SNAPSHOT=false
+          fi
+
+          echo "PROJECT_VERSION $PROJECT_VERSION"
+          echo "::set-output name=snapshot::$(echo $IS_SNAPSHOT)"
+
+  prepare_snapshot:
+    runs-on: ubuntu-latest
+    needs: check_snapshot
+    if: needs.check_snapshot.outputs.is_snapshot == 'false'
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set up Java for publishing to Maven Central Repository
+        uses: actions/setup-java@v2
+        with:
+          java-version: '11'
+          distribution: 'adopt'
+
+      - id: getversion
+        name: Get project version
+        run: |
+          PROJECT_VERSION=$( \
+            mvn org.apache.maven.plugins:maven-help-plugin:3.1.0:evaluate \
+            -q -DforceStdout -Dexpression=project.version \
+          )
+
+          echo "The project version is ${PROJECT_VERSION}"
+          echo "::set-env name=V_MAJOR::$(echo $PROJECT_VERSION | cut -d'.' -f1)"
+          echo "::set-env name=V_MINOR::$(echo $PROJECT_VERSION | cut -d'.' -f2)"
+          echo "::set-env name=V_PATCH::$(echo $PROJECT_VERSION | cut -d'.' -f3)"
+        env:
+          ACTIONS_ALLOW_UNSECURE_COMMANDS: 'true'
+
+      - name: Upgrade major version
+        if: startsWith(github.ref, 'refs/heads/release/')
+        run: |
+          major=$(($V_MAJOR + 1))
+          echo "::set-env name=NEW_SNAPSHOT::$(echo "${major}.0.0-SNAPSHOT")"
+        env:
+          ACTIONS_ALLOW_UNSECURE_COMMANDS: 'true'
+
+      - name: Upgrade minor version
+        if: startsWith(github.ref, 'refs/heads/feature/')
+        run: |
+          minor=$((V_MINOR + 1))
+          echo "::set-env name=NEW_SNAPSHOT::$(echo "${V_MAJOR}.${minor}.0-SNAPSHOT")"
+        env:
+          ACTIONS_ALLOW_UNSECURE_COMMANDS: 'true'
+
+      - name: Upgrade patch version
+        if: startsWith(github.ref, 'refs/heads/fix/')
+        run: |
+          patch=$(($V_PATCH + 1))
+          echo "::set-env name=NEW_SNAPSHOT::$(echo "${V_MAJOR}.${V_MINOR}.${patch}-SNAPSHOT")"
+        env:
+          ACTIONS_ALLOW_UNSECURE_COMMANDS: 'true'
+
+      - name: Configure git
+        run: |
+          git config --global committer.email "noreply@github.com"
+          git config --global committer.name "GitHub"
+          git config --global author.email "${GITHUB_ACTOR}@users.noreply.github.com"
+          git config --global author.name "${GITHUB_ACTOR}"
+
+      - name: Set the upgraded version & commit it
+        run: |
+          echo "Snapshot version upgraded to ${NEW_SNAPSHOT}"
+          mvn versions:set -DnewVersion=$NEW_SNAPSHOT --no-transfer-progress
+          git add .
+          git commit -m "[github-actions] prepare snapshot ${NEW_SNAPSHOT}"
+          git pull origin ${{ github.event.ref }}
+          git push origin ${{ github.event.ref }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
